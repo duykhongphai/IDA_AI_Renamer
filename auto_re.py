@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 import idaapi, idautils, idc, ida_hexrays, ida_funcs, ida_name, ida_segment
-import json, os, re, time, threading, queue, concurrent.futures
+import json, os, re, time, threading, queue
+from collections import deque
 
 try:
     import requests
     HAS_REQUESTS = True
     SESSION = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=3)
+    adapter = requests.adapters.HTTPAdapter(pool_connections=30, pool_maxsize=30, max_retries=2, pool_block=False)
     SESSION.mount('http://', adapter)
     SESSION.mount('https://', adapter)
 except ImportError:
@@ -18,11 +19,11 @@ import urllib.request, urllib.error
 if idaapi.IDA_SDK_VERSION >= 920:
     from PySide6.QtWidgets import *
     from PySide6.QtGui import QFont
-    from PySide6.QtCore import Qt, Signal, QTimer, QAbstractTableModel, QModelIndex
+    from PySide6.QtCore import Qt, Signal, QTimer, QAbstractTableModel, QModelIndex, QThread
 else:
     from PyQt5.QtWidgets import *
     from PyQt5.QtGui import QFont
-    from PyQt5.QtCore import Qt, QTimer, QAbstractTableModel, QModelIndex
+    from PyQt5.QtCore import Qt, QTimer, QAbstractTableModel, QModelIndex, QThread
     Signal = __import__('PyQt5.QtCore', fromlist=['pyqtSignal']).pyqtSignal
 
 CONFIG_FILE = os.path.join(idaapi.get_user_idadir(), 'ai_rename_config.json')
@@ -32,8 +33,8 @@ QWidget{background:#1a1a1a;color:#e0e0e0;font:9pt 'Segoe UI'}
 QDialog{background:#1a1a1a}
 QGroupBox{font-weight:600;border:2px solid #2d2d2d;border-radius:6px;margin-top:16px;padding:12px 8px 8px 8px;background:#212121}
 QGroupBox::title{subcontrol-origin:margin;left:12px;padding:0 8px;color:#4fc3f7;font-weight:600}
-QLineEdit{background:#2d2d2d;border:2px solid #3d3d3d;border-radius:4px;padding:8px 10px;color:#e0e0e0}
-QLineEdit:focus{border:2px solid #1e88e5;background:#333}
+QLineEdit,QTextEdit{background:#2d2d2d;border:2px solid #3d3d3d;border-radius:4px;padding:6px 8px;color:#e0e0e0}
+QLineEdit:focus,QTextEdit:focus{border:2px solid #1e88e5;background:#333}
 QLineEdit:disabled{background:#252525;color:#666}
 QPushButton{background:#1e88e5;color:#fff;border:none;border-radius:4px;padding:8px 16px;font-weight:600}
 QPushButton:hover{background:#2196f3}
@@ -53,35 +54,66 @@ QTableView::item:selected{background:#1565c0;color:#fff}
 QHeaderView::section{background:#252525;padding:8px 6px;border:none;border-right:1px solid #2d2d2d;border-bottom:2px solid #1e88e5;font-weight:600;color:#4fc3f7}
 QProgressBar{border:2px solid #2d2d2d;border-radius:4px;text-align:center;background:#2d2d2d;color:#fff;font-weight:600}
 QProgressBar::chunk{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #1e88e5,stop:1 #42a5f5);border-radius:2px}
-QTextEdit{background:#1e1e1e;border:2px solid #2d2d2d;border-radius:4px;font:8pt 'Consolas';color:#e0e0e0;padding:4px}
 QLabel{color:#b0b0b0}
 QScrollBar:vertical{background:#2d2d2d;width:12px;border-radius:6px}
 QScrollBar::handle:vertical{background:#424242;border-radius:6px;min-height:20px}
 QScrollBar::handle:vertical:hover{background:#4fc3f7}
 QSpinBox{background:#2d2d2d;border:2px solid #3d3d3d;border-radius:4px;padding:4px 8px;color:#e0e0e0}
 QSpinBox:focus{border:2px solid #1e88e5}
+QCheckBox{spacing:6px}
+QCheckBox::indicator{width:16px;height:16px;border-radius:3px;border:2px solid #3d3d3d;background:#2d2d2d}
+QCheckBox::indicator:checked{background:#1e88e5;border-color:#1e88e5}
 """
 
 SKIP_SEGS = {'.plt','.plt.got','.plt.sec','extern','.extern','.got','.got.plt','.init','.fini','.dynsym','.dynstr','LOAD','.interp','.rela.dyn','.rela.plt','.hash','.gnu.hash','.note','.note.gnu.build-id','.note.ABI-tag'}
 SYS_PREFIX = ('__cxa_','__gxx_','__gnu_','__libc_','__ctype_','_GLOBAL_','_init','_fini','_start','atexit','malloc','free','memcpy','memset','strlen','printf','scanf','fprintf','sprintf','operator','std::','boost::','__stack_chk','__security','_security','__report','__except','__imp_','__x86.','__do_global')
 SYS_MODULES = ('kernel32.','ntdll.','user32.','advapi32.','msvcrt.','ucrtbase.','ws2_32.','libc.so','libm.so','libpthread','foundation.','corefoundation.','uikit.')
 
+DEFAULT_PROMPT = """You are an expert reverse engineer. Analyze the decompiled code and suggest a descriptive function name.
+
+Rules:
+- Use snake_case format
+- Be specific and descriptive (e.g., parse_user_config, validate_license_key, decrypt_network_packet)
+- Focus on what the function DOES, not how
+- Use common prefixes: init_, parse_, validate_, process_, handle_, send_, recv_, encrypt_, decrypt_, load_, save_, get_, set_, create_, destroy_, check_, is_, has_
+- Keep names 3-40 characters
+- NO generic names like: func1, do_something, process_data, handle_stuff
+
+Output ONLY the function name, nothing else."""
+
+DEFAULT_BATCH_PROMPT = """You are an expert reverse engineer. For each function below, suggest a descriptive snake_case name.
+
+Rules:
+- snake_case format only
+- Be specific: parse_config_file, validate_user_token, send_heartbeat_packet
+- Focus on WHAT function does
+- Common prefixes: init_, parse_, validate_, process_, handle_, send_, recv_, encrypt_, decrypt_, load_, save_, get_, set_, create_, destroy_, check_, is_, has_
+- 3-40 chars per name
+- NO generic names
+
+Output format - exactly one name per line, numbered:
+1. suggested_name_one
+2. suggested_name_two
+..."""
+
 def load_config():
     try:
         if os.path.exists(CONFIG_FILE):
             c = json.load(open(CONFIG_FILE))
-            c.setdefault('batch_size', 15)
-            c.setdefault('parallel_workers', 8)
+            c.setdefault('batch_size', 20)
+            c.setdefault('parallel_workers', 10)
             c.setdefault('filter_system', True)
             c.setdefault('filter_empty', True)
             c.setdefault('min_func_size', 10)
             c.setdefault('max_xrefs', 100)
+            c.setdefault('custom_prompt', '')
+            c.setdefault('use_custom_prompt', False)
             return c
     except: pass
-    return {'api_url':'','api_key':'','model':'','batch_size':15,'parallel_workers':8,'filter_system':True,'filter_empty':True,'min_func_size':10,'max_xrefs':100}
+    return {'api_url':'','api_key':'','model':'','batch_size':20,'parallel_workers':10,'filter_system':True,'filter_empty':True,'min_func_size':10,'max_xrefs':100,'custom_prompt':'','use_custom_prompt':False}
 
 def save_config(c):
-    try: json.dump(c, open(CONFIG_FILE,'w'))
+    try: json.dump(c, open(CONFIG_FILE,'w'), indent=2)
     except: pass
 
 def is_valid_seg(ea):
@@ -110,72 +142,86 @@ def get_xref_count(ea):
         if c > 150: break
     return c
 
-def get_code_fast(ea, max_len=1500):
-    try:
-        cf = ida_hexrays.decompile(ea)
-        if cf: return str(cf)[:max_len]
-    except: pass
-    f = ida_funcs.get_func(ea)
-    if not f: return None
-    lines = []
-    cur = f.start_ea
-    while cur < f.end_ea and len(lines) < 30:
-        lines.append(idc.GetDisasm(cur))
-        cur = idc.next_head(cur, f.end_ea)
-    return '\n'.join(lines)[:max_len]
+def get_code_fast(ea, max_len=1200):
+    result = [None]
+    def _get_code():
+        try:
+            cf = ida_hexrays.decompile(ea)
+            if cf:
+                result[0] = str(cf)[:max_len]
+                return
+        except: pass
+        f = ida_funcs.get_func(ea)
+        if not f:
+            result[0] = None
+            return
+        lines = []
+        cur = f.start_ea
+        while cur < f.end_ea and len(lines) < 25:
+            lines.append(idc.GetDisasm(cur))
+            cur = idc.next_head(cur, f.end_ea)
+        result[0] = '\n'.join(lines)[:max_len]
+    idaapi.execute_sync(_get_code, idaapi.MFF_READ)
+    return result[0]
 
 def get_strings_fast(ea):
-    r = []
-    try:
-        for item in idautils.FuncItems(ea):
-            for xref in idautils.DataRefsFrom(item):
-                s = idc.get_strlit_contents(xref)
-                if s:
-                    try:
-                        s = s.decode() if isinstance(s, bytes) else s
-                        if 2 < len(s) < 80: r.append(s)
-                    except: pass
-            if len(r) >= 5: break
-    except: pass
-    return list(set(r))[:5]
+    result = [[]]
+    def _get_strings():
+        r = []
+        try:
+            for item in idautils.FuncItems(ea):
+                for xref in idautils.DataRefsFrom(item):
+                    s = idc.get_strlit_contents(xref)
+                    if s:
+                        try:
+                            s = s.decode() if isinstance(s, bytes) else s
+                            if 2 < len(s) < 60: r.append(s[:50])
+                        except: pass
+                if len(r) >= 4: break
+        except: pass
+        result[0] = list(set(r))[:4]
+    idaapi.execute_sync(_get_strings, idaapi.MFF_READ)
+    return result[0]
 
 def get_calls_fast(ea):
-    r = []
-    try:
-        for item in idautils.FuncItems(ea):
-            for xref in idautils.CodeRefsFrom(item, False):
-                n = idc.get_func_name(xref)
-                if n and not n.startswith('sub_'): r.append(n)
-            if len(r) >= 6: break
-    except: pass
-    return list(set(r))[:6]
+    result = [[]]
+    def _get_calls():
+        r = []
+        try:
+            for item in idautils.FuncItems(ea):
+                for xref in idautils.CodeRefsFrom(item, False):
+                    n = idc.get_func_name(xref)
+                    if n and not n.startswith('sub_'): r.append(n)
+                if len(r) >= 5: break
+        except: pass
+        result[0] = list(set(r))[:5]
+    idaapi.execute_sync(_get_calls, idaapi.MFF_READ)
+    return result[0]
 
-def ai_request(cfg, prompt):
+def ai_request(cfg, prompt, sys_prompt):
     url, key, model = cfg['api_url'], cfg['api_key'], cfg['model']
     hdrs = {'Content-Type': 'application/json'}
     is_ollama = 'localhost:11434' in url or '127.0.0.1:11434' in url
     is_anthropic = 'anthropic.com' in url
     is_ollama_native = is_ollama and '/api/' in url
     
-    sys_prompt = 'You are a reverse engineer. Reply with ONLY unique snake_case function names, one per line. No explanations.'
-    
     if is_ollama_native:
-        data = {'model':model,'messages':[{'role':'system','content':sys_prompt},{'role':'user','content':prompt}],'stream':False}
+        data = {'model':model,'messages':[{'role':'system','content':sys_prompt},{'role':'user','content':prompt}],'stream':False,'options':{'temperature':0.1,'num_predict':500}}
     elif is_anthropic:
         hdrs['x-api-key'] = key
         hdrs['anthropic-version'] = '2023-06-01'
-        data = {'model':model,'max_tokens':300,'messages':[{'role':'user','content':sys_prompt+'\n\n'+prompt}]}
+        data = {'model':model,'max_tokens':500,'messages':[{'role':'user','content':sys_prompt+'\n\n'+prompt}],'temperature':0.1}
     else:
         if key: hdrs['Authorization'] = f'Bearer {key}'
-        data = {'model':model,'messages':[{'role':'system','content':sys_prompt},{'role':'user','content':prompt}],'max_tokens':300,'temperature':0.1}
+        data = {'model':model,'messages':[{'role':'system','content':sys_prompt},{'role':'user','content':prompt}],'max_tokens':500,'temperature':0.1}
     
     if HAS_REQUESTS and SESSION:
-        r = SESSION.post(url, headers=hdrs, json=data, timeout=180)
+        r = SESSION.post(url, headers=hdrs, json=data, timeout=120)
         r.raise_for_status()
         res = r.json()
     else:
         req = urllib.request.Request(url, json.dumps(data).encode(), hdrs)
-        with urllib.request.urlopen(req, timeout=180) as r:
+        with urllib.request.urlopen(req, timeout=120) as r:
             res = json.loads(r.read().decode())
     
     if is_ollama_native: return res.get('message',{}).get('content','').strip()
@@ -184,18 +230,23 @@ def ai_request(cfg, prompt):
 
 def clean_name(name, existing=None):
     if not name: return None
-    name = re.sub(r'[`"\'\n]', '', name)
+    name = re.sub(r'[`"\'\n\r\t]', '', name)
     name = name.split('(')[0].split(':')[-1].strip()
+    name = re.sub(r'^[\d\.\-\*\s]+', '', name)
     m = re.search(r'\b([a-z][a-z0-9_]*[a-z0-9])\b', name.lower())
-    name = m.group(1) if m else re.sub(r'_+', '_', re.sub(r'[^a-zA-Z0-9_]', '_', name)).strip('_').lower()
-    name = re.sub(r'^[0-9]+', '', name)[:55]
-    if not name or len(name) < 2: return None
+    if m:
+        name = m.group(1)
+    else:
+        name = re.sub(r'_+', '_', re.sub(r'[^a-zA-Z0-9_]', '_', name)).strip('_').lower()
+    name = re.sub(r'^[0-9_]+', '', name)[:50]
+    if not name or len(name) < 3: return None
+    if name in ('function','func','sub','unknown','unnamed','noname'): return None
     if existing:
         orig, cnt = name, 1
         while name in existing:
             name = f"{orig}_{cnt}"
             cnt += 1
-            if cnt > 50: return None
+            if cnt > 99: return None
     return name
 
 class FuncData:
@@ -203,6 +254,10 @@ class FuncData:
     def __init__(self, ea, name):
         self.ea, self.name, self.suggested, self.status, self.checked = ea, name, '', 'Pending', True
         self.code = self.strings = self.calls = None
+
+class ResultSignal(QThread):
+    result = Signal(list)
+    def __init__(self): super().__init__()
 
 class VirtualFuncModel(QAbstractTableModel):
     HEADERS = ['','Address','Current','Suggested','Status']
@@ -226,7 +281,7 @@ class VirtualFuncModel(QAbstractTableModel):
             self.filtered = list(range(len(self.funcs)))
         else:
             ft = self.filter_text.lower()
-            self.filtered = [i for i,f in enumerate(self.funcs) if ft in f.name.lower() or ft in f'{f.ea:x}']
+            self.filtered = [i for i,f in enumerate(self.funcs) if ft in f.name.lower() or ft in f'{f.ea:x}' or (f.suggested and ft in f.suggested.lower())]
     
     def set_filter(self, t):
         self.beginResetModel()
@@ -243,7 +298,7 @@ class VirtualFuncModel(QAbstractTableModel):
         f = self.funcs[self.filtered[idx.row()]]
         c = idx.column()
         if role == Qt.DisplayRole:
-            if c==0: return '[X]' if f.checked else '[ ]'
+            if c==0: return 'X' if f.checked else ''
             elif c==1: return f'{f.ea:X}'
             elif c==2: return f.name
             elif c==3: return f.suggested
@@ -253,46 +308,149 @@ class VirtualFuncModel(QAbstractTableModel):
     
     def flags(self, idx): return Qt.ItemIsEnabled | Qt.ItemIsSelectable
     def get_func(self, row): return self.funcs[self.filtered[row]] if 0<=row<len(self.filtered) else None
-    def refresh_row(self, idx):
-        if idx in self.filtered:
-            row = self.filtered.index(idx)
-            self.dataChanged.emit(self.index(row,0), self.index(row,4))
+    def get_func_idx(self, row): return self.filtered[row] if 0<=row<len(self.filtered) else -1
+    
+    def refresh_rows(self, indices):
+        if not indices: return
+        rows = [self.filtered.index(i) for i in indices if i in self.filtered]
+        if rows:
+            self.dataChanged.emit(self.index(min(rows),0), self.index(max(rows),4))
+    
     def toggle_all(self, chk):
         for f in self.funcs: f.checked = chk
         if self.filtered: self.dataChanged.emit(self.index(0,0), self.index(len(self.filtered)-1,0))
+    
     def get_checked(self): return [(i,f) for i,f in enumerate(self.funcs) if f.checked]
+    def get_with_suggestions(self): return [(i,f) for i,f in enumerate(self.funcs) if f.checked and f.suggested]
     def total(self): return len(self.funcs)
+
+class AnalyzeWorker(QThread):
+    batch_done = Signal(list)
+    progress = Signal(int, int)
+    finished = Signal(int)
+    log = Signal(str, str)
+    
+    def __init__(self, cfg, items, existing, sys_prompt, batch_size):
+        super().__init__()
+        self.cfg = cfg
+        self.items = items
+        self.existing = set(existing)
+        self.sys_prompt = sys_prompt
+        self.batch_size = batch_size
+        self.running = True
+    
+    def stop(self):
+        self.running = False
+    
+    def run(self):
+        done = 0
+        total = len(self.items)
+        batches = [self.items[i:i+self.batch_size] for i in range(0, total, self.batch_size)]
+        
+        for batch in batches:
+            if not self.running: break
+            results = self.process_batch(batch)
+            for idx, func, name in results:
+                if name:
+                    self.existing.add(name)
+            self.batch_done.emit(results)
+            done += len(batch)
+            self.progress.emit(done, total)
+        
+        self.finished.emit(done)
+    
+    def process_batch(self, batch):
+        results = []
+        valid = []
+        
+        for idx, func in batch:
+            if not func.code:
+                func.code = get_code_fast(func.ea, 800)
+                func.strings = get_strings_fast(func.ea)
+                func.calls = get_calls_fast(func.ea)
+            if func.code:
+                valid.append((idx, func))
+            else:
+                results.append((idx, func, None))
+        
+        if not valid:
+            return results
+        
+        try:
+            if len(valid) == 1:
+                idx, f = valid[0]
+                prompt = f"Code:\n```\n{f.code}\n```"
+                if f.strings: prompt += f"\nStrings found: {f.strings}"
+                if f.calls: prompt += f"\nCalled functions: {f.calls}"
+                resp = ai_request(self.cfg, prompt, self.sys_prompt)
+                name = clean_name(resp, self.existing)
+                results.append((idx, f, name))
+            else:
+                prompt = "Functions to name:\n\n"
+                for i, (idx, f) in enumerate(valid):
+                    prompt += f"[{i+1}]\n```\n{f.code[:600]}\n```\n"
+                    if f.strings: prompt += f"Strings: {f.strings[:3]}\n"
+                    if f.calls: prompt += f"Calls: {f.calls[:3]}\n"
+                    prompt += "\n"
+                
+                resp = ai_request(self.cfg, prompt, self.sys_prompt)
+                names = self.parse_batch_response(resp, len(valid))
+                
+                for i, (idx, f) in enumerate(valid):
+                    name = clean_name(names[i], self.existing) if i < len(names) else None
+                    if name:
+                        self.existing.add(name)
+                    results.append((idx, f, name))
+                    
+        except Exception as e:
+            self.log.emit(f'API Error: {str(e)[:80]}', 'err')
+            for idx, f in valid:
+                results.append((idx, f, None))
+        
+        return results
+    
+    def parse_batch_response(self, resp, expected):
+        names = []
+        for line in resp.split('\n'):
+            line = line.strip()
+            if not line or '```' in line: continue
+            line = re.sub(r'^[\d\.\)\-\*\s]+', '', line).strip()
+            if line and 2 < len(line) < 60:
+                parts = line.split()
+                nm = parts[0] if parts else line
+                nm = re.sub(r'[^a-zA-Z0-9_]', '', nm)
+                if nm and len(nm) >= 3:
+                    names.append(nm)
+        while len(names) < expected:
+            names.append(None)
+        return names[:expected]
 
 class AIRenameDialog(QDialog):
     def __init__(self):
         super().__init__()
         self.cfg = load_config()
         self.model = None
-        self.is_loading = self.is_analyzing = False
-        self.load_timer = self.analyze_timer = None
+        self.is_loading = False
+        self.load_timer = None
         self.func_iter = None
         self.temp_funcs = []
         self.scanned = 0
-        self.analyze_queue = []
-        self.analyze_idx = 0
-        self.workers = {}
-        self.active_workers = 0
+        self.workers = []
         self.existing_names = set()
-        self.code_cache = {}
         self.setup_ui()
     
     def setup_ui(self):
-        self.setWindowTitle('AI Rename Ultra v5.0 - 200K Functions')
-        self.setMinimumSize(1100, 800)
+        self.setWindowTitle('AI Rename Ultra v6.0 - High Performance')
+        self.setMinimumSize(1150, 850)
         self.setStyleSheet(STYLES)
         
         layout = QVBoxLayout(self)
-        layout.setSpacing(8)
+        layout.setSpacing(6)
         layout.setContentsMargins(10,10,10,10)
         
-        api = QGroupBox('API')
+        api = QGroupBox('API Configuration')
         al = QVBoxLayout(api)
-        al.setSpacing(8)
+        al.setSpacing(6)
         
         pr = QHBoxLayout()
         for n,p in [('Ollama','ollama'),('OpenAI','openai'),('Claude','claude'),('OpenRouter','openrouter')]:
@@ -301,15 +459,24 @@ class AIRenameDialog(QDialog):
             b.clicked.connect(lambda c,x=p: self.set_preset(x))
             pr.addWidget(b)
         pr.addStretch()
+        self.toggle_btn = QPushButton('Collapse')
+        self.toggle_btn.setObjectName('secondary')
+        self.toggle_btn.clicked.connect(self.toggle_api)
+        pr.addWidget(self.toggle_btn)
         al.addLayout(pr)
         
+        self.api_content = QWidget()
+        acl = QVBoxLayout(self.api_content)
+        acl.setContentsMargins(0,0,0,0)
+        acl.setSpacing(6)
+        
         gl = QGridLayout()
-        gl.setSpacing(8)
+        gl.setSpacing(6)
         self.url_edit = QLineEdit(self.cfg.get('api_url',''))
         self.url_edit.setPlaceholderText('http://localhost:11434/v1/chat/completions')
         self.key_edit = QLineEdit(self.cfg.get('api_key',''))
         self.key_edit.setEchoMode(QLineEdit.Password)
-        self.key_edit.setPlaceholderText('Optional for Ollama')
+        self.key_edit.setPlaceholderText('Optional for local Ollama')
         self.model_edit = QLineEdit(self.cfg.get('model',''))
         self.model_edit.setPlaceholderText('qwen2.5-coder:14b')
         gl.addWidget(QLabel('URL:'),0,0)
@@ -318,53 +485,62 @@ class AIRenameDialog(QDialog):
         gl.addWidget(self.key_edit,1,1)
         gl.addWidget(QLabel('Model:'),2,0)
         gl.addWidget(self.model_edit,2,1)
-        al.addLayout(gl)
+        acl.addLayout(gl)
+        
+        self.custom_prompt_cb = QCheckBox('Use Custom Prompt')
+        self.custom_prompt_cb.setChecked(self.cfg.get('use_custom_prompt', False))
+        acl.addWidget(self.custom_prompt_cb)
+        
+        self.custom_prompt_edit = QTextEdit()
+        self.custom_prompt_edit.setPlaceholderText('Custom system prompt (leave empty to use default optimized prompt)')
+        self.custom_prompt_edit.setText(self.cfg.get('custom_prompt', ''))
+        self.custom_prompt_edit.setMaximumHeight(80)
+        acl.addWidget(self.custom_prompt_edit)
         
         br = QHBoxLayout()
-        sb = QPushButton('Save')
+        sb = QPushButton('Save Config')
         sb.clicked.connect(self.save_cfg)
         br.addWidget(sb)
-        tb = QPushButton('Test')
+        tb = QPushButton('Test API')
         tb.clicked.connect(self.test_api)
         br.addWidget(tb)
+        db = QPushButton('Show Default Prompt')
+        db.setObjectName('secondary')
+        db.clicked.connect(self.show_default_prompt)
+        br.addWidget(db)
         br.addStretch()
-        self.toggle_btn = QPushButton('Hide')
-        self.toggle_btn.setObjectName('secondary')
-        self.toggle_btn.clicked.connect(self.toggle_api)
-        br.addWidget(self.toggle_btn)
-        al.addLayout(br)
+        acl.addLayout(br)
+        al.addWidget(self.api_content)
         layout.addWidget(api)
         self.api_group = api
         
-        perf = QGroupBox('Performance (200K Mode)')
+        perf = QGroupBox('Performance Settings')
         pl = QGridLayout(perf)
         pl.setSpacing(8)
         
         self.batch_spin = QSpinBox()
         self.batch_spin.setRange(1,50)
-        self.batch_spin.setValue(self.cfg.get('batch_size',15))
-        self.batch_spin.setToolTip('Functions per API call (15-30 recommended)')
-        pl.addWidget(QLabel('Batch:'),0,0)
+        self.batch_spin.setValue(self.cfg.get('batch_size',20))
+        self.batch_spin.setToolTip('Functions per API call (15-25 optimal for Qwen)')
+        pl.addWidget(QLabel('Batch Size:'),0,0)
         pl.addWidget(self.batch_spin,0,1)
         
         self.workers_spin = QSpinBox()
         self.workers_spin.setRange(1,20)
-        self.workers_spin.setValue(self.cfg.get('parallel_workers',8))
-        self.workers_spin.setToolTip('Parallel API requests (8-15 recommended)')
+        self.workers_spin.setValue(self.cfg.get('parallel_workers',10))
+        self.workers_spin.setToolTip('Parallel workers (8-12 for local, 3-5 for cloud)')
         pl.addWidget(QLabel('Workers:'),0,2)
         pl.addWidget(self.workers_spin,0,3)
         
         self.min_size_spin = QSpinBox()
         self.min_size_spin.setRange(0,1000)
         self.min_size_spin.setValue(self.cfg.get('min_func_size',10))
-        self.min_size_spin.setToolTip('Skip functions smaller than N bytes')
-        pl.addWidget(QLabel('Min Size:'),0,4)
+        pl.addWidget(QLabel('Min Size (bytes):'),0,4)
         pl.addWidget(self.min_size_spin,0,5)
         
         self.max_xref_spin = QSpinBox()
         self.max_xref_spin.setRange(0,500)
         self.max_xref_spin.setValue(self.cfg.get('max_xrefs',100))
-        self.max_xref_spin.setToolTip('Skip functions with >N xrefs (likely stdlib)')
         pl.addWidget(QLabel('Max XRefs:'),0,6)
         pl.addWidget(self.max_xref_spin,0,7)
         
@@ -373,40 +549,39 @@ class AIRenameDialog(QDialog):
         self.batch_spin.valueChanged.connect(self.update_speed)
         self.workers_spin.valueChanged.connect(self.update_speed)
         self.update_speed()
-        pl.addWidget(self.speed_lbl,1,0,1,8)
+        pl.addWidget(self.speed_lbl,1,0,1,4)
+        
+        self.filter_sys_cb = QCheckBox('Skip System Functions')
+        self.filter_sys_cb.setChecked(self.cfg.get('filter_system',True))
+        pl.addWidget(self.filter_sys_cb,1,4,1,2)
+        
+        self.filter_empty_cb = QCheckBox('Skip Tiny Functions')
+        self.filter_empty_cb.setChecked(self.cfg.get('filter_empty',True))
+        pl.addWidget(self.filter_empty_cb,1,6,1,2)
+        
         layout.addWidget(perf)
         self.perf_group = perf
-        
-        filt = QGroupBox('Smart Filter')
-        fl = QHBoxLayout(filt)
-        self.filter_sys_cb = QCheckBox('Skip System')
-        self.filter_sys_cb.setChecked(self.cfg.get('filter_system',True))
-        fl.addWidget(self.filter_sys_cb)
-        self.filter_empty_cb = QCheckBox('Skip Empty/Tiny')
-        self.filter_empty_cb.setChecked(self.cfg.get('filter_empty',True))
-        fl.addWidget(self.filter_empty_cb)
-        self.preload_cb = QCheckBox('Preload Code (RAM↑ Speed↑)')
-        self.preload_cb.setChecked(True)
-        fl.addWidget(self.preload_cb)
-        fl.addStretch()
-        layout.addWidget(filt)
         
         tb = QHBoxLayout()
         self.load_btn = QPushButton('Load All sub_*')
         self.load_btn.clicked.connect(self.load_funcs)
         tb.addWidget(self.load_btn)
-        lb = QPushButton('Current')
+        lb = QPushButton('Load Current')
         lb.setObjectName('secondary')
         lb.clicked.connect(self.load_current)
         tb.addWidget(lb)
+        rlb = QPushButton('Load Range')
+        rlb.setObjectName('secondary')
+        rlb.clicked.connect(self.load_range)
+        tb.addWidget(rlb)
         tb.addWidget(QLabel('|'))
         self.filter_edit = QLineEdit()
-        self.filter_edit.setPlaceholderText('Filter...')
-        self.filter_edit.setFixedWidth(180)
+        self.filter_edit.setPlaceholderText('Filter by name/address...')
+        self.filter_edit.setFixedWidth(200)
         self.filter_edit.textChanged.connect(lambda t: self.model.set_filter(t) or self.update_count())
         tb.addWidget(self.filter_edit)
         tb.addStretch()
-        self.count_lbl = QLabel('0')
+        self.count_lbl = QLabel('0 functions')
         self.count_lbl.setStyleSheet('color:#4fc3f7;font-weight:600;font-size:10pt')
         tb.addWidget(self.count_lbl)
         layout.addLayout(tb)
@@ -416,28 +591,28 @@ class AIRenameDialog(QDialog):
         self.table.setModel(self.model)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QTableView.SelectRows)
-        self.table.setSelectionMode(QTableView.SingleSelection)
+        self.table.setSelectionMode(QTableView.ExtendedSelection)
         self.table.doubleClicked.connect(self.jump_to)
         self.table.clicked.connect(self.on_click)
         self.table.setShowGrid(False)
-        self.table.setColumnWidth(0,40)
-        self.table.setColumnWidth(1,100)
-        self.table.setColumnWidth(4,80)
+        self.table.setColumnWidth(0,35)
+        self.table.setColumnWidth(1,95)
+        self.table.setColumnWidth(4,75)
         h = self.table.horizontalHeader()
         h.setSectionResizeMode(2, QHeaderView.Stretch)
         h.setSectionResizeMode(3, QHeaderView.Stretch)
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(26)
+        self.table.verticalHeader().setDefaultSectionSize(24)
         layout.addWidget(self.table)
         
         pl = QHBoxLayout()
         self.progress = QProgressBar()
         self.progress.setVisible(False)
-        self.progress.setFixedHeight(22)
+        self.progress.setFixedHeight(20)
         pl.addWidget(self.progress)
-        self.status_lbl = QLabel('')
+        self.status_lbl = QLabel('Ready')
         self.status_lbl.setStyleSheet('color:#4fc3f7;font-weight:600')
-        self.status_lbl.setMinimumWidth(200)
+        self.status_lbl.setMinimumWidth(250)
         pl.addWidget(self.status_lbl)
         layout.addLayout(pl)
         
@@ -446,20 +621,20 @@ class AIRenameDialog(QDialog):
         ll.addStretch()
         cb = QPushButton('Clear')
         cb.setObjectName('secondary')
-        cb.setFixedWidth(80)
+        cb.setFixedWidth(70)
         cb.clicked.connect(lambda: self.log.clear())
         ll.addWidget(cb)
         layout.addLayout(ll)
         
         self.log = QTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMaximumHeight(90)
+        self.log.setMaximumHeight(80)
         layout.addWidget(self.log)
-        self.add_log(f'HTTP: {"requests+pool" if HAS_REQUESTS else "urllib"}', 'info')
+        self.add_log(f'HTTP: {"requests+connection_pool" if HAS_REQUESTS else "urllib"}', 'info')
         
         ar = QHBoxLayout()
-        self.analyze_btn = QPushButton('Analyze')
-        self.analyze_btn.setMinimumWidth(120)
+        self.analyze_btn = QPushButton('Analyze Selected')
+        self.analyze_btn.setMinimumWidth(140)
         self.analyze_btn.clicked.connect(self.start_analyze)
         ar.addWidget(self.analyze_btn)
         self.stop_btn = QPushButton('Stop')
@@ -469,51 +644,54 @@ class AIRenameDialog(QDialog):
         self.stop_btn.setEnabled(False)
         ar.addWidget(self.stop_btn)
         ar.addStretch()
-        ab = QPushButton('All')
+        ab = QPushButton('Select All')
         ab.setObjectName('secondary')
-        ab.setFixedWidth(50)
+        ab.setFixedWidth(80)
         ab.clicked.connect(lambda: self.model.toggle_all(True))
         ar.addWidget(ab)
-        nb = QPushButton('None')
+        nb = QPushButton('Select None')
         nb.setObjectName('secondary')
-        nb.setFixedWidth(50)
+        nb.setFixedWidth(80)
         nb.clicked.connect(lambda: self.model.toggle_all(False))
         ar.addWidget(nb)
-        self.apply_btn = QPushButton('Apply')
+        self.apply_btn = QPushButton('Apply Renames')
         self.apply_btn.setObjectName('apply')
-        self.apply_btn.setMinimumWidth(120)
+        self.apply_btn.setMinimumWidth(140)
         self.apply_btn.clicked.connect(self.apply_renames)
-        self.apply_btn.setEnabled(False)
         ar.addWidget(self.apply_btn)
         layout.addLayout(ar)
     
     def update_speed(self):
         b, w = self.batch_spin.value(), self.workers_spin.value()
-        fps = (b * w) / 2.5
-        t100 = 100/fps
-        t1k = 1000/fps
-        t10k = 10000/fps
-        t200k = 200000/fps
-        self.speed_lbl.setText(f'~{fps:.0f} func/s | 1K:{t1k/60:.0f}m | 10K:{t10k/60:.0f}m | 200K:{t200k/3600:.1f}h')
+        fps = (b * w) / 2.0
+        self.speed_lbl.setText(f'Est. ~{fps:.0f} func/s | 1K: {1000/fps/60:.1f}m | 10K: {10000/fps/60:.0f}m | 100K: {100000/fps/3600:.1f}h')
     
     def toggle_api(self):
-        v = self.api_group.isVisible()
-        self.api_group.setVisible(not v)
-        self.perf_group.setVisible(not v)
-        self.toggle_btn.setText('Show' if v else 'Hide')
+        v = self.api_content.isVisible()
+        self.api_content.setVisible(not v)
+        self.toggle_btn.setText('Expand' if v else 'Collapse')
     
     def set_preset(self, p):
         presets = {
             'ollama': ('http://localhost:11434/v1/chat/completions','','qwen2.5-coder:14b'),
             'openai': ('https://api.openai.com/v1/chat/completions','','gpt-4o-mini'),
             'claude': ('https://api.anthropic.com/v1/messages','','claude-sonnet-4-20250514'),
-            'openrouter': ('https://openrouter.ai/api/v1/chat/completions','','openai/gpt-4o-mini'),
+            'openrouter': ('https://openrouter.ai/api/v1/chat/completions','','qwen/qwen-2.5-coder-32b-instruct'),
         }
         if p in presets:
             u,k,m = presets[p]
             self.url_edit.setText(u)
             self.model_edit.setText(m)
-            self.add_log(f'Preset: {p}', 'ok')
+            if p == 'ollama':
+                self.workers_spin.setValue(10)
+                self.batch_spin.setValue(20)
+            else:
+                self.workers_spin.setValue(5)
+                self.batch_spin.setValue(15)
+            self.add_log(f'Preset applied: {p}', 'ok')
+    
+    def show_default_prompt(self):
+        QMessageBox.information(self, 'Default Prompts', f'Single Function:\n{DEFAULT_PROMPT}\n\n---\n\nBatch:\n{DEFAULT_BATCH_PROMPT}')
     
     def on_click(self, idx):
         if idx.column() == 0:
@@ -532,46 +710,56 @@ class AIRenameDialog(QDialog):
             'filter_system': self.filter_sys_cb.isChecked(),
             'filter_empty': self.filter_empty_cb.isChecked(),
             'min_func_size': self.min_size_spin.value(),
-            'max_xrefs': self.max_xref_spin.value()
+            'max_xrefs': self.max_xref_spin.value(),
+            'custom_prompt': self.custom_prompt_edit.toPlainText(),
+            'use_custom_prompt': self.custom_prompt_cb.isChecked()
         }
         save_config(self.cfg)
-        self.add_log('Saved', 'ok')
+        self.add_log('Configuration saved', 'ok')
     
     def add_log(self, msg, lv='info'):
         colors = {'info':'#aaa','ok':'#4ec9b0','err':'#f14c4c','warn':'#dcdcaa'}
         self.log.append(f'<span style="color:{colors.get(lv,"#aaa")}">[{time.strftime("%H:%M:%S")}] {msg}</span>')
-        self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
+        sb = self.log.verticalScrollBar()
+        sb.setValue(sb.maximum())
     
     def update_count(self):
         v, t = self.model.rowCount(), self.model.total()
-        self.count_lbl.setText(f'{v:,}/{t:,}' if v!=t else f'{t:,}')
+        sug = sum(1 for f in self.model.funcs if f.suggested)
+        txt = f'{v:,}/{t:,}' if v!=t else f'{t:,}'
+        if sug: txt += f' ({sug} suggestions)'
+        self.count_lbl.setText(txt)
     
     def test_api(self):
         self.save_cfg()
         if not self.cfg['api_url'] or not self.cfg['model']:
-            QMessageBox.warning(self, 'Warning', 'Enter URL & Model')
+            QMessageBox.warning(self, 'Warning', 'Please enter API URL and Model')
             return
-        self.add_log('Testing...', 'info')
+        self.add_log('Testing API connection...', 'info')
         self.status_lbl.setText('Testing...')
         self.test_result = None
+        
         def do_test():
             try:
                 st = time.time()
-                r = ai_request(self.cfg, 'int add(int a, int b){return a+b;}\nName?')
-                self.test_result = (True, r, time.time()-st)
+                prompt = 'int add(int a, int b){return a+b;}'
+                r = ai_request(self.cfg, prompt, 'Reply with only a snake_case function name for this code.')
+                self.test_result = (True, r.strip(), time.time()-st)
             except Exception as e:
                 self.test_result = (False, str(e), 0)
+        
         t = threading.Thread(target=do_test, daemon=True)
         t.start()
+        
         def check():
             if self.test_result:
                 ok, r, el = self.test_result
                 if ok:
-                    self.add_log(f'OK: "{r}" ({el:.1f}s)', 'ok')
-                    self.status_lbl.setText(f'OK ({el:.1f}s)')
+                    self.add_log(f'API OK: "{r}" ({el:.2f}s)', 'ok')
+                    self.status_lbl.setText(f'API OK ({el:.2f}s)')
                 else:
-                    self.add_log(f'Error: {r}', 'err')
-                    self.status_lbl.setText('Error')
+                    self.add_log(f'API Error: {r[:100]}', 'err')
+                    self.status_lbl.setText('API Error')
             else:
                 QTimer.singleShot(100, check)
         QTimer.singleShot(100, check)
@@ -581,10 +769,9 @@ class AIRenameDialog(QDialog):
         self.temp_funcs = []
         self.scanned = 0
         self.is_loading = True
-        self.code_cache = {}
         self.progress.setVisible(True)
         self.progress.setRange(0,0)
-        self.status_lbl.setText('Scanning...')
+        self.status_lbl.setText('Scanning functions...')
         self.load_btn.setEnabled(False)
         self.analyze_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -597,13 +784,13 @@ class AIRenameDialog(QDialog):
         if not self.is_loading:
             self.finish_load()
             return
+        
         min_size = self.min_size_spin.value()
         max_xrefs = self.max_xref_spin.value()
         filter_sys = self.filter_sys_cb.isChecked()
         filter_empty = self.filter_empty_cb.isChecked()
-        preload = self.preload_cb.isChecked()
         
-        for _ in range(1000):
+        for _ in range(2000):
             try:
                 ea = next(self.func_iter)
                 self.scanned += 1
@@ -615,27 +802,25 @@ class AIRenameDialog(QDialog):
                     sz = get_func_size(ea)
                     if sz < min_size: continue
                     if max_xrefs > 0 and get_xref_count(ea) > max_xrefs: continue
-                fd = FuncData(ea, name)
-                if preload:
-                    fd.code = get_code_fast(ea, 800)
-                    if not fd.code: continue
-                    fd.strings = get_strings_fast(ea)
-                    fd.calls = get_calls_fast(ea)
-                self.temp_funcs.append(fd)
+                self.temp_funcs.append(FuncData(ea, name))
             except StopIteration:
                 self.finish_load()
                 return
-        self.status_lbl.setText(f'Scanned {self.scanned:,} | Found {len(self.temp_funcs):,}')
+        
+        if self.scanned % 10000 < 2000:
+            self.status_lbl.setText(f'Scanned {self.scanned:,} | Found {len(self.temp_funcs):,}')
     
     def finish_load(self):
         self.is_loading = False
-        if self.load_timer: self.load_timer.stop()
+        if self.load_timer:
+            self.load_timer.stop()
+            self.load_timer = None
         self.model.set_data(self.temp_funcs)
         self.temp_funcs = []
         self.progress.setVisible(False)
         self.update_count()
-        self.add_log(f'Loaded {self.model.total():,}', 'ok')
-        self.status_lbl.setText(f'Loaded {self.model.total():,}')
+        self.add_log(f'Loaded {self.model.total():,} functions', 'ok')
+        self.status_lbl.setText(f'Loaded {self.model.total():,} functions')
         self.load_btn.setEnabled(True)
         self.analyze_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
@@ -651,7 +836,29 @@ class AIRenameDialog(QDialog):
             fd.calls = get_calls_fast(f.start_ea)
             self.model.set_data([fd])
             self.update_count()
-            self.add_log(f'Loaded: {name}', 'ok')
+            self.add_log(f'Loaded current: {name}', 'ok')
+    
+    def load_range(self):
+        start, ok1 = QInputDialog.getText(self, 'Range', 'Start address (hex):')
+        if not ok1: return
+        end, ok2 = QInputDialog.getText(self, 'Range', 'End address (hex):')
+        if not ok2: return
+        try:
+            start_ea = int(start, 16)
+            end_ea = int(end, 16)
+        except:
+            QMessageBox.warning(self, 'Error', 'Invalid hex address')
+            return
+        
+        funcs = []
+        for ea in idautils.Functions(start_ea, end_ea):
+            name = idc.get_func_name(ea)
+            if name and name.startswith('sub_'):
+                funcs.append(FuncData(ea, name))
+        
+        self.model.set_data(funcs)
+        self.update_count()
+        self.add_log(f'Loaded {len(funcs)} functions in range', 'ok')
     
     def get_existing(self):
         ex = set()
@@ -662,177 +869,114 @@ class AIRenameDialog(QDialog):
             if f.suggested: ex.add(f.suggested)
         return ex
     
+    def get_system_prompt(self, is_batch=False):
+        if self.custom_prompt_cb.isChecked() and self.custom_prompt_edit.toPlainText().strip():
+            return self.custom_prompt_edit.toPlainText().strip()
+        return DEFAULT_BATCH_PROMPT if is_batch else DEFAULT_PROMPT
+    
     def start_analyze(self):
         if not self.model.total():
             QMessageBox.warning(self, 'Warning', 'Load functions first')
             return
         self.save_cfg()
         if not self.cfg['api_url'] or not self.cfg['model']:
-            QMessageBox.warning(self, 'Warning', 'Enter API URL and Model')
+            QMessageBox.warning(self, 'Warning', 'Please configure API settings')
             return
+        
         items = self.model.get_checked()
         if not items:
             QMessageBox.warning(self, 'Warning', 'No functions selected')
             return
         
-        if len(items) > 100:
-            msg = QMessageBox(self)
-            msg.setWindowTitle('Select Count')
-            msg.setText(f'{len(items):,} functions. How many?')
-            btns = [(100,'100'),(500,'500'),(1000,'1K'),(5000,'5K'),(10000,'10K'),(50000,'50K'),(len(items),f'All {len(items):,}')]
-            created = []
-            for cnt,txt in btns:
-                if cnt <= len(items):
-                    b = msg.addButton(txt, QMessageBox.ActionRole)
-                    created.append((b,cnt))
-            msg.addButton('Cancel', QMessageBox.RejectRole)
-            msg.exec_()
-            clicked = msg.clickedButton()
-            sel = None
-            for b,c in created:
-                if b == clicked: sel = c; break
-            if sel is None: return
+        count = len(items)
+        if count > 500:
+            choices = []
+            for n in [100, 500, 1000, 2000, 5000, 10000, 50000, count]:
+                if n <= count:
+                    choices.append(str(n) if n < 10000 else f'{n//1000}K')
+            choice, ok = QInputDialog.getItem(self, 'Select Count', f'{count:,} functions selected. Analyze how many?', choices, 0, False)
+            if not ok: return
+            sel = int(choice.replace('K','000'))
             items = items[:sel]
         
-        self.analyze_queue = items
-        self.analyze_idx = 0
-        self.is_analyzing = True
-        self.workers = {}
-        self.active_workers = 0
+        for w in self.workers:
+            w.stop()
+        self.workers = []
+        
         self.existing_names = self.get_existing()
         self.analyze_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.apply_btn.setEnabled(False)
         self.progress.setVisible(True)
         self.progress.setRange(0, len(items))
         self.progress.setValue(0)
-        self.add_log(f'Analyzing {len(items):,} (batch={self.batch_spin.value()}, workers={self.workers_spin.value()})...', 'info')
-        self.analyze_timer = QTimer(self)
-        self.analyze_timer.timeout.connect(self.analyze_tick)
-        self.analyze_timer.start(30)
-    
-    def analyze_tick(self):
-        if not self.is_analyzing:
-            self.finish_analyze()
-            return
-        
-        for wid in list(self.workers.keys()):
-            w = self.workers[wid]
-            if w.get('done'):
-                for idx, func, suggested, err, el in w['results']:
-                    if suggested:
-                        func.suggested = suggested
-                        func.status = 'OK'
-                        self.existing_names.add(suggested)
-                    else:
-                        func.status = 'ERR' if err else 'SKIP'
-                        func.checked = False
-                    self.model.refresh_row(idx)
-                self.progress.setValue(self.progress.value() + len(w['results']))
-                self.active_workers -= 1
-                del self.workers[wid]
-        
-        queued = sum(len(w.get('batch',[])) for w in self.workers.values() if not w.get('done'))
-        start_idx = self.analyze_idx + queued
-        
-        if start_idx >= len(self.analyze_queue) and self.active_workers == 0:
-            self.finish_analyze()
-            return
         
         batch_size = self.batch_spin.value()
-        max_workers = self.workers_spin.value()
+        num_workers = self.workers_spin.value()
+        sys_prompt = self.get_system_prompt(batch_size > 1)
         
-        while self.active_workers < max_workers and start_idx < len(self.analyze_queue):
-            batch = []
-            for i in range(batch_size):
-                if start_idx + i >= len(self.analyze_queue): break
-                idx, func = self.analyze_queue[start_idx + i]
-                if not func.code:
-                    func.code = get_code_fast(func.ea, 800)
-                    func.strings = get_strings_fast(func.ea)
-                    func.calls = get_calls_fast(func.ea)
-                batch.append((idx, func))
-            
-            if not batch: break
-            
-            wid = f'w{len(self.workers)}'
-            self.workers[wid] = {'done':False,'batch':batch,'results':[]}
-            self.active_workers += 1
-            start_idx += len(batch)
-            self.analyze_idx += len(batch)
-            
-            self.status_lbl.setText(f'{self.progress.value()}/{len(self.analyze_queue)} [{self.active_workers}w]')
-            
-            existing_copy = set(self.existing_names)
-            t = threading.Thread(target=self.worker_run, args=(wid, batch, existing_copy), daemon=True)
-            t.start()
+        chunk_size = max(1, len(items) // num_workers)
+        chunks = [items[i:i+chunk_size] for i in range(0, len(items), chunk_size)]
+        
+        self.add_log(f'Starting analysis: {len(items):,} functions, {len(chunks)} workers, batch={batch_size}', 'info')
+        self.completed = 0
+        self.total_items = len(items)
+        
+        for chunk in chunks:
+            worker = AnalyzeWorker(self.cfg, chunk, self.existing_names, sys_prompt, batch_size)
+            worker.batch_done.connect(self.on_batch_done)
+            worker.progress.connect(self.on_progress)
+            worker.finished.connect(self.on_worker_finished)
+            worker.log.connect(self.add_log)
+            self.workers.append(worker)
+            worker.start()
     
-    def worker_run(self, wid, batch, existing):
-        results = []
-        try:
-            valid = [(idx,f) for idx,f in batch if f.code]
-            if not valid:
-                for idx,f in batch:
-                    results.append((idx, f, None, 'No code', 0))
-            elif len(valid) == 1:
-                idx, f = valid[0]
-                st = time.time()
-                prompt = f"```\n{f.code}\n```\n"
-                if f.strings: prompt += f"Strings: {f.strings}\n"
-                if f.calls: prompt += f"Calls: {f.calls}\n"
-                prompt += "Function name?"
-                resp = ai_request(self.cfg, prompt)
-                name = clean_name(resp, existing)
-                results.append((idx, f, name, None, time.time()-st))
+    def on_batch_done(self, results):
+        indices = []
+        for idx, func, name in results:
+            if name:
+                func.suggested = name
+                func.status = 'OK'
+                self.existing_names.add(name)
             else:
-                st = time.time()
-                prompt = "Name these functions (snake_case, one per line):\n\n"
-                for i,(idx,f) in enumerate(valid):
-                    prompt += f"{i+1}. ```\n{f.code[:500]}\n```\n"
-                    if f.strings: prompt += f"   Strings: {f.strings[:3]}\n"
-                prompt += f"\nProvide {len(valid)} unique names:"
-                
-                resp = ai_request(self.cfg, prompt)
-                names = []
-                for line in resp.split('\n'):
-                    line = line.strip()
-                    if line and len(line)<60 and ':' not in line and '```' not in line:
-                        parts = line.split()
-                        if parts:
-                            nm = parts[-1] if len(parts)>1 and parts[0].replace('.','').isdigit() else parts[0]
-                            if 2<=len(nm)<=55: names.append(nm)
-                
-                el = time.time() - st
-                avg = el / len(valid)
-                for i,(idx,f) in enumerate(valid):
-                    nm = clean_name(names[i], existing) if i<len(names) else None
-                    if nm: existing.add(nm)
-                    results.append((idx, f, nm, None, avg))
-        except Exception as e:
-            for idx,f in batch:
-                results.append((idx, f, None, str(e)[:50], 0))
-        
-        self.workers[wid]['results'] = results
-        self.workers[wid]['done'] = True
+                func.status = 'Skip'
+            indices.append(idx)
+        self.model.refresh_rows(indices)
+        self.update_count()
+    
+    def on_progress(self, done, total):
+        self.completed += done - getattr(self, '_last_done', 0)
+        self._last_done = done
+        self.progress.setValue(min(self.completed, self.total_items))
+        self.status_lbl.setText(f'Analyzing: {self.completed:,}/{self.total_items:,}')
+    
+    def on_worker_finished(self, count):
+        active = sum(1 for w in self.workers if w.isRunning())
+        if active == 0:
+            self.finish_analyze()
     
     def finish_analyze(self):
-        self.is_analyzing = False
-        if self.analyze_timer: self.analyze_timer.stop()
         self.progress.setVisible(False)
-        done = sum(1 for f in self.model.funcs if f.suggested)
-        self.status_lbl.setText(f'Done: {done} suggestions')
-        self.add_log(f'Complete: {done} suggestions', 'ok')
+        suggestions = sum(1 for f in self.model.funcs if f.suggested)
+        self.status_lbl.setText(f'Done: {suggestions:,} suggestions')
+        self.add_log(f'Analysis complete: {suggestions:,} suggestions', 'ok')
         self.analyze_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.apply_btn.setEnabled(True)
+        self.workers = []
+        self._last_done = 0
     
     def stop_all(self):
-        self.is_loading = self.is_analyzing = False
-        if self.load_timer: self.load_timer.stop()
-        if self.analyze_timer: self.analyze_timer.stop()
+        self.is_loading = False
+        if self.load_timer:
+            self.load_timer.stop()
+            self.load_timer = None
+        
+        for w in self.workers:
+            w.stop()
+        
         if self.temp_funcs:
             self.model.set_data(self.temp_funcs)
             self.temp_funcs = []
+        
         self.add_log('Stopped', 'warn')
         self.progress.setVisible(False)
         self.update_count()
@@ -845,23 +989,32 @@ class AIRenameDialog(QDialog):
         if f: idaapi.jumpto(f.ea)
     
     def apply_renames(self):
+        items = self.model.get_with_suggestions()
+        if not items:
+            self.add_log('No functions with suggestions to apply', 'warn')
+            return
+        
         applied = 0
-        for i,f in self.model.get_checked():
-            if f.suggested:
-                if ida_name.set_name(f.ea, f.suggested, ida_name.SN_NOWARN|ida_name.SN_FORCE):
-                    applied += 1
-                    f.name = f.suggested
-                    f.suggested = ''
-                    f.status = 'Applied'
-                    self.model.refresh_row(i)
-        self.add_log(f'Applied {applied}', 'ok')
-        QMessageBox.information(self, 'Done', f'Applied {applied} renames')
+        indices = []
+        for i, f in items:
+            if ida_name.set_name(f.ea, f.suggested, ida_name.SN_NOWARN|ida_name.SN_FORCE):
+                applied += 1
+                f.name = f.suggested
+                f.suggested = ''
+                f.status = 'Applied'
+                f.checked = False
+                indices.append(i)
+        
+        self.model.refresh_rows(indices)
+        self.update_count()
+        self.add_log(f'Applied {applied:,} renames', 'ok')
+        self.status_lbl.setText(f'Applied {applied:,} renames')
 
 class AIRenamePlugin(idaapi.plugin_t):
     flags = idaapi.PLUGIN_KEEP
-    comment = "AI function renaming"
+    comment = "AI-powered function renaming"
     help = ""
-    wanted_name = "AI Rename"
+    wanted_name = "AI Rename Ultra"
     wanted_hotkey = "Ctrl+Shift+R"
     
     def __init__(self): self.dlg = None
